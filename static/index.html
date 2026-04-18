@@ -12,13 +12,24 @@ body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background:#0a0a0a
 .status-badge { padding:4px 12px; border-radius:12px; font-size:0.8em; border:1px solid #444; }
 .container { display:grid; grid-template-columns:300px 1fr; height:calc(100vh - 70px); }
 .sidebar { background:#111; border-right:1px solid #222; overflow-y:auto; padding:15px; }
-.sidebar h3 { color:#ff6666; font-size:0.85em; text-transform:uppercase; letter-spacing:1px; margin:15px 0 8px; }
+.sidebar h3 { color:#ff6666; font-size:0.85em; text-transform:uppercase; letter-spacing:1px; margin:15px 0 8px; cursor:pointer; }
+.sidebar h3:hover { color:#ff8888; }
+.sidebar h3 .toggle { font-size:0.7em; margin-right:4px; }
 .tech-item { padding:8px 10px; margin:2px 0; border-radius:6px; cursor:pointer; font-size:0.78em; transition:all 0.15s; border-left:3px solid transparent; }
 .tech-item:hover { background:#1a1a1a; border-left-color:#ff4444; }
 .tech-item .tech-id { color:#888; font-size:0.7em; }
 .tech-item .tech-name { color:#ccc; }
 .tech-item.stratus { border-left-color:#ff6644; }
 .tech-item.atomic { border-left-color:#44aaff; }
+.section-content { overflow:hidden; transition:max-height 0.3s; }
+.section-content.collapsed { max-height:0 !important; }
+
+/* Reports sidebar */
+.report-item { padding:8px 10px; margin:2px 0; border-radius:6px; cursor:pointer; font-size:0.75em; transition:all 0.15s; border-left:3px solid #ffa500; }
+.report-item:hover { background:#1a1a1a; border-left-color:#ffcc00; }
+.report-item .report-date { color:#888; font-size:0.7em; }
+.report-item .report-threat { font-size:0.7em; }
+
 .main { display:flex; flex-direction:column; }
 .chat { flex:1; overflow-y:auto; padding:20px; }
 .msg { margin:10px 0; padding:12px 16px; border-radius:8px; max-width:85%; }
@@ -33,8 +44,43 @@ body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background:#0a0a0a
 .input-bar button { background:#ff4444; color:#fff; border:none; padding:12px 24px; margin-left:10px; border-radius:8px; cursor:pointer; font-family:inherit; font-weight:bold; }
 .input-bar button:hover { background:#ff6666; }
 .examples { padding:10px; font-size:0.75em; color:#666; text-align:center; }
-.examples span { cursor:pointer; color:#884444; margin:0 8px; }
+.examples span { cursor:pointer; color:#884444; margin:0 6px; }
 .examples span:hover { color:#ff4444; }
+.examples span.web { color:#448844; }
+.examples span.web:hover { color:#44ff44; }
+.examples span.report { color:#886644; }
+.examples span.report:hover { color:#ffaa44; }
+
+/* Report markdown view */
+.report-view { background:#0d0d0d; border:1px solid #333; border-radius:8px; padding:16px; margin-top:10px; font-size:0.82em; line-height:1.6; max-height:600px; overflow-y:auto; }
+.report-view h1 { color:#ff4444; font-size:1.3em; margin-bottom:10px; }
+.report-view h2 { color:#ff8844; font-size:1.1em; margin:15px 0 8px; border-bottom:1px solid #333; padding-bottom:4px; }
+.report-view h3 { color:#ffaa44; font-size:0.95em; margin:10px 0 5px; }
+.report-view table { width:100%; border-collapse:collapse; margin:8px 0; }
+.report-view th, .report-view td { border:1px solid #333; padding:6px 10px; text-align:left; font-size:0.85em; }
+.report-view th { background:#1a1a1a; color:#ff8844; }
+.report-view code { background:#1a1a1a; padding:2px 6px; border-radius:3px; color:#44ff44; }
+.report-view blockquote { border-left:3px solid #ff8844; padding:8px 12px; margin:8px 0; background:#111; color:#ccc; }
+.report-view ul, .report-view ol { margin-left:20px; }
+.report-view li { margin:3px 0; }
+.report-view hr { border:none; border-top:1px solid #333; margin:12px 0; }
+.report-view strong { color:#fff; }
+.report-view em { color:#aaa; }
+
+/* Web scan results */
+.scan-result { margin-top:8px; }
+.scan-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+.risk-badge { padding:3px 10px; border-radius:10px; font-size:0.75em; font-weight:bold; }
+.risk-CRITICAL { background:#ff000030; color:#ff4444; border:1px solid #ff4444; }
+.risk-HIGH { background:#ff660030; color:#ff8844; border:1px solid #ff8844; }
+.risk-MEDIUM { background:#ffaa0030; color:#ffcc44; border:1px solid #ffcc44; }
+.risk-LOW { background:#44ff4430; color:#44ff44; border:1px solid #44ff44; }
+.finding-group { margin:8px 0; padding:8px; background:#0d0d0d; border:1px solid #222; border-radius:4px; }
+.finding-group h4 { color:#ff8844; font-size:0.8em; margin-bottom:6px; }
+.finding-item { font-size:0.78em; padding:2px 0; }
+.finding-item.present { color:#44ff44; }
+.finding-item.missing { color:#ff4444; }
+.finding-item.info { color:#aaa; }
 </style>
 </head>
 <body>
@@ -44,40 +90,61 @@ body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background:#0a0a0a
   <div>
     <span class="status-badge" id="status-badge">connecting...</span>
     <span class="status-badge" id="tool-count">0 techniques</span>
+    <span class="status-badge" id="report-count">0 reports</span>
   </div>
 </div>
 
 <div class="container">
   <div class="sidebar" id="sidebar">
-    <h3>🔥 GCP Cloud Attacks (Stratus)</h3>
-    <div id="stratus-list"></div>
-    <h3>💻 Endpoint Attacks (Atomic)</h3>
-    <div id="atomic-list"></div>
+    <h3 onclick="toggleSection('reports-section')"><span class="toggle">▾</span>📊 Reports</h3>
+    <div id="reports-section" class="section-content">
+      <div id="reports-list"><div class="tech-item" style="color:#666">No reports yet</div></div>
+    </div>
+
+    <h3 onclick="toggleSection('stratus-section')"><span class="toggle">▾</span>🔥 GCP Cloud Attacks (Stratus)</h3>
+    <div id="stratus-section" class="section-content">
+      <div id="stratus-list"></div>
+    </div>
+
+    <h3 onclick="toggleSection('atomic-section')"><span class="toggle">▾</span>💻 Endpoint Attacks (Atomic)</h3>
+    <div id="atomic-section" class="section-content">
+      <div id="atomic-list"></div>
+    </div>
   </div>
 
   <div class="main">
     <div class="chat" id="chat">
       <div class="msg bot">
-        <strong style="color:#ff4444">☠️ RedTeam MCP</strong><br><br>
-        Natural language attack simulation. Tell me what you want to attack.<br><br>
-        Examples:<br>
+        <strong style="color:#ff4444">☠️ RedTeam MCP v2.0</strong><br><br>
+        Natural language attack simulation + web app pentesting.<br><br>
+        <strong>🔥 Attack Simulation:</strong><br>
         • <em>"Simulate credential theft against my GCP project"</em><br>
         • <em>"Run a full cloud kill chain"</em><br>
-        • <em>"Test if my rules detect privilege escalation"</em><br>
-        • <em>"Disable logging to test defense evasion detection"</em>
+        • <em>"Disable logging to test defense evasion detection"</em><br><br>
+        <strong>🌐 Web App Scanning:</strong><br>
+        • <em>"Scan https://example.com for vulnerabilities"</em><br>
+        • <em>"Check security headers on https://example.com"</em><br>
+        • <em>"Discover paths on https://example.com"</em><br><br>
+        <strong>📊 Reports:</strong><br>
+        • <em>"Show reports"</em> — view generated reports<br>
+        • Reports auto-generate after attack simulations
       </div>
     </div>
 
     <div class="examples">
-      Try: <span onclick="setInput('simulate credential theft')">credential theft</span>
+      Try:
+      <span onclick="setInput('simulate credential theft')">credential theft</span>
       <span onclick="setInput('simulate disable logging')">disable logging</span>
       <span onclick="setInput('dry run full attack chain')">full kill chain</span>
       <span onclick="setInput('list gcp attacks')">list attacks</span>
-      <span onclick="setInput('simulate lateral movement')">lateral movement</span>
+      <span class="web" onclick="setInput('scan web app https://example.com')">🌐 scan website</span>
+      <span class="web" onclick="setInput('check headers https://example.com')">🔒 check headers</span>
+      <span class="web" onclick="setInput('discover paths https://example.com')">📁 find paths</span>
+      <span class="report" onclick="setInput('show reports')">📊 reports</span>
     </div>
 
     <div class="input-bar">
-      <input type="text" id="input" placeholder="Describe your attack... (e.g., 'simulate stealing service account credentials')" autocomplete="off">
+      <input type="text" id="input" placeholder="Describe your attack or scan... (e.g., 'scan https://target.com for vulnerabilities')" autocomplete="off">
       <button id="send" onclick="sendMessage()">⚡ Execute</button>
     </div>
   </div>
@@ -93,12 +160,200 @@ let historyIdx = -1;
 
 function setInput(text) { input.value = text; input.focus(); }
 
+function toggleSection(id) {
+  const el = document.getElementById(id);
+  el.classList.toggle('collapsed');
+}
+
 function addMsg(text, cls) {
   const div = document.createElement('div');
   div.className = `msg ${cls}`;
   div.innerHTML = text;
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
+}
+
+// Simple markdown to HTML converter for reports
+function markdownToHtml(md) {
+  let html = md
+    .replace(/^### (.*$)/gm, '<h3>$1</h3>')
+    .replace(/^## (.*$)/gm, '<h2>$1</h2>')
+    .replace(/^# (.*$)/gm, '<h1>$1</h1>')
+    .replace(/^\> (.*$)/gm, '<blockquote>$1</blockquote>')
+    .replace(/^---$/gm, '<hr>')
+    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.*?)\*/g, '<em>$1</em>')
+    .replace(/_(.*?)_/g, '<em>$1</em>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/^- (.*$)/gm, '<li>$1</li>')
+    .replace(/^  - (.*$)/gm, '<li style="margin-left:20px">$1</li>');
+
+  // Convert tables
+  html = html.replace(/((?:^\|.*\|$\n?)+)/gm, function(tableBlock) {
+    const rows = tableBlock.trim().split('\n').filter(r => !r.match(/^\|[\s-|]+\|$/));
+    if (rows.length === 0) return tableBlock;
+    let table = '<table>';
+    rows.forEach((row, i) => {
+      const cells = row.split('|').filter(c => c.trim() !== '');
+      const tag = i === 0 ? 'th' : 'td';
+      table += '<tr>' + cells.map(c => `<${tag}>${c.trim()}</${tag}>`).join('') + '</tr>';
+    });
+    table += '</table>';
+    return table;
+  });
+
+  // Wrap consecutive <li> in <ul>
+  html = html.replace(/((?:<li.*?>.*?<\/li>\s*)+)/g, '<ul>$1</ul>');
+
+  // Paragraphs for remaining text
+  html = html.split('\n').map(line => {
+    if (line.trim() === '') return '';
+    if (line.match(/^<(h[1-3]|ul|li|table|tr|th|td|hr|blockquote)/)) return line;
+    return line;
+  }).join('\n');
+
+  return html;
+}
+
+function renderWebScan(data) {
+  let html = `<div class="scan-result">`;
+  html += `<div class="scan-header"><strong>🌐 ${data.url || ''}</strong>`;
+  if (data.risk_level) {
+    html += ` <span class="risk-badge risk-${data.risk_level}">${data.risk_level}</span>`;
+  }
+  html += `</div>`;
+
+  if (data.risk_summary && data.risk_summary.length > 0) {
+    html += `<div class="finding-group"><h4>⚠️ Risk Summary</h4>`;
+    data.risk_summary.forEach(r => { html += `<div class="finding-item missing">• ${r}</div>`; });
+    html += `</div>`;
+  }
+
+  const findings = data.findings || data;
+
+  // Security headers
+  const hdrs = findings.security_headers || findings.headers_present;
+  if (hdrs) {
+    const src = findings.security_headers || findings;
+    html += `<div class="finding-group"><h4>🔒 Security Headers (Score: ${src.score || 'N/A'}% — Grade: ${src.grade || 'N/A'})</h4>`;
+    if (src.headers_present) {
+      Object.entries(src.headers_present).forEach(([k, v]) => {
+        html += `<div class="finding-item present">✅ ${k}: ${typeof v === 'object' ? v.value : v}</div>`;
+      });
+    }
+    if (src.headers_missing) {
+      Object.entries(src.headers_missing).forEach(([k, v]) => {
+        html += `<div class="finding-item missing">❌ ${k} — ${typeof v === 'object' ? v.description : v} (${typeof v === 'object' ? v.severity : ''})</div>`;
+      });
+    }
+    html += `</div>`;
+  }
+
+  // SSL
+  if (findings.ssl_tls) {
+    const s = findings.ssl_tls;
+    html += `<div class="finding-group"><h4>🔐 SSL/TLS</h4>`;
+    if (s.valid === true) {
+      html += `<div class="finding-item present">✅ Valid certificate — expires in ${s.days_until_expiry} days (${s.protocol || ''})</div>`;
+    } else if (s.valid === false) {
+      html += `<div class="finding-item missing">❌ Invalid certificate: ${s.error || 'unknown'}</div>`;
+    } else if (s.ssl === false) {
+      html += `<div class="finding-item missing">⚠️ ${s.note || s.error || 'No HTTPS'}</div>`;
+    }
+    html += `</div>`;
+  }
+
+  // Paths
+  if (findings.path_discovery) {
+    const p = findings.path_discovery;
+    html += `<div class="finding-group"><h4>📁 Path Discovery (${p.paths_found || 0} found / ${p.paths_tested || 0} tested)</h4>`;
+    (p.results || []).forEach(r => {
+      const color = ['.env', '.git', 'admin', 'debug', 'actuator', 'phpmy'].some(s => r.path.includes(s)) ? 'missing' : 'info';
+      html += `<div class="finding-item ${color}">${r.status} ${r.path} (${r.content_type || ''}, ${r.size}b)</div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Server disclosure
+  if (findings.server_disclosure && findings.server_disclosure.disclosure_count > 0) {
+    html += `<div class="finding-group"><h4>🏷️ Server Disclosure</h4>`;
+    Object.entries(findings.server_disclosure.disclosed_headers || {}).forEach(([k, v]) => {
+      html += `<div class="finding-item missing">⚠️ ${k}: ${v}</div>`;
+    });
+    html += `</div>`;
+  }
+
+  // CORS
+  if (findings.cors && findings.cors.vulnerable) {
+    html += `<div class="finding-group"><h4>🔓 CORS Misconfiguration</h4>`;
+    html += `<div class="finding-item missing">❌ CORS is misconfigured — allows arbitrary origins</div>`;
+    html += `</div>`;
+  }
+
+  // HTTP Methods
+  if (findings.http_methods && findings.http_methods.dangerous_methods && findings.http_methods.dangerous_methods.length > 0) {
+    html += `<div class="finding-group"><h4>⚡ Dangerous HTTP Methods</h4>`;
+    findings.http_methods.dangerous_methods.forEach(m => {
+      html += `<div class="finding-item missing">⚠️ ${m.method} (status ${m.status})</div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Open Redirects
+  if (findings.open_redirects && findings.open_redirects.vulnerable_params && findings.open_redirects.vulnerable_params.length > 0) {
+    html += `<div class="finding-group"><h4>↗️ Open Redirects</h4>`;
+    findings.open_redirects.vulnerable_params.forEach(p => {
+      html += `<div class="finding-item missing">❌ ?${p.param}= redirects to ${p.redirect_to}</div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Injection Points
+  if (findings.injection_points && findings.injection_points.potential_xss_points > 0) {
+    html += `<div class="finding-group"><h4>💉 Parameter Reflection (Potential XSS)</h4>`;
+    findings.injection_points.reflections.forEach(r => {
+      html += `<div class="finding-item missing">⚠️ Parameter '${r.param}' reflected in ${r.context}</div>`;
+    });
+    html += `</div>`;
+  }
+
+  html += `</div>`;
+  return html;
+}
+
+async function loadReports() {
+  try {
+    const res = await fetch('/api/reports');
+    const data = await res.json();
+    const list = document.getElementById('reports-list');
+    document.getElementById('report-count').textContent = `${data.count} reports`;
+    if (data.count === 0) {
+      list.innerHTML = '<div class="tech-item" style="color:#666">No reports yet</div>';
+      return;
+    }
+    list.innerHTML = '';
+    data.reports.forEach(r => {
+      const div = document.createElement('div');
+      div.className = 'report-item';
+      div.innerHTML = `<div class="report-date">${new Date(r.timestamp).toLocaleString()}</div>
+        <div>${r.query}</div>
+        <div class="report-threat">${r.threat_level} — Score: ${r.posture_score}%</div>`;
+      div.onclick = () => loadReport(r.id);
+      list.appendChild(div);
+    });
+  } catch(e) {}
+}
+
+async function loadReport(id) {
+  try {
+    const res = await fetch(`/api/reports/${id}`);
+    const data = await res.json();
+    const html = `<strong style="color:#ff8844">📊 Report</strong> <span style="color:#666;font-size:0.8em">${data.id}</span>
+      <div class="report-view">${markdownToHtml(data.markdown)}</div>`;
+    addMsg(html, 'bot');
+  } catch(e) {
+    addMsg(`<span class="failure">Failed to load report: ${e.message}</span>`, 'bot');
+  }
 }
 
 async function sendMessage() {
@@ -123,7 +378,44 @@ async function sendMessage() {
     });
     const data = await res.json();
     let html = `<strong style="color:#ff4444">☠️ RedTeam</strong><br>${data.response || ''}`;
-    if (data.results) {
+
+    // Handle web scan results
+    if (data.type === 'web_scan' && data.results) {
+      html += renderWebScan(data.results);
+    }
+    // Handle report display
+    else if (data.type === 'report' && data.report) {
+      html += `<div class="report-view">${markdownToHtml(data.report)}</div>`;
+    }
+    // Handle reports list
+    else if (data.type === 'reports_list' && data.reports) {
+      html += '<div class="result">';
+      data.reports.forEach(r => {
+        html += `<div style="padding:4px 0;cursor:pointer" onclick="loadReport('${r.id}')">
+          <strong>${r.threat_level}</strong> — ${r.query} — Score: ${r.posture_score}%
+          <span style="color:#666;font-size:0.8em">${new Date(r.timestamp).toLocaleString()}</span>
+        </div>`;
+      });
+      html += '</div>';
+    }
+    // Handle attack with report
+    else if (data.type === 'attack_with_report') {
+      if (data.results) {
+        for (const r of data.results) {
+          const status = r.success === true ? '<span class="success">✅ SUCCESS</span>' : r.success === false ? '<span class="failure">❌ FAILED</span>' : '📋 PLANNED';
+          html += `<div class="result">${status} <strong>${r.technique || r.id || ''}</strong> (${r.engine || ''})<br>${r.name || ''}<br>`;
+          if (r.stdout) html += `<pre>${r.stdout.substring(0, 500)}</pre>`;
+          if (r.error) html += `<span class="failure">${r.error}</span>`;
+          html += `</div>`;
+        }
+      }
+      if (data.report) {
+        html += `<div class="report-view">${markdownToHtml(data.report)}</div>`;
+      }
+      loadReports();
+    }
+    // Regular attack results
+    else if (data.results) {
       for (const r of data.results) {
         const status = r.success === true ? '<span class="success">✅ SUCCESS</span>' : r.success === false ? '<span class="failure">❌ FAILED</span>' : '📋 PLANNED';
         html += `<div class="result">${status} <strong>${r.technique || r.id || ''}</strong> (${r.engine || ''})<br>${r.name || ''}<br>`;
@@ -132,7 +424,8 @@ async function sendMessage() {
         html += `</div>`;
       }
     }
-    if (data.techniques && !data.results) {
+    // Technique list
+    else if (data.techniques && !data.results) {
       html += '<div class="result">';
       for (const t of data.techniques.slice(0, 20)) {
         html += `<div style="padding:2px 0"><strong>${t.id}</strong> — ${t.name || ''}</div>`;
@@ -153,14 +446,17 @@ input.addEventListener('keydown', e => {
   if (e.key === 'ArrowDown') { e.preventDefault(); if (historyIdx > 0) { historyIdx--; input.value = cmdHistory[historyIdx]; } else if (historyIdx === 0) { historyIdx = -1; input.value = ''; }}
 });
 
-// Load health + sidebar
+// Load health + sidebar + reports
 fetch('/health').then(r=>r.json()).then(d=>{
   document.getElementById('status-badge').textContent = '✅ online';
   document.getElementById('status-badge').style.borderColor = '#4caf50';
   document.getElementById('tool-count').textContent = `${d.stratus_techniques + d.atomic_techniques} techniques`;
+  document.getElementById('report-count').textContent = `${d.reports_count || 0} reports`;
 }).catch(()=>{
   document.getElementById('status-badge').textContent = '❌ offline';
 });
+
+loadReports();
 </script>
 </body>
 </html>
