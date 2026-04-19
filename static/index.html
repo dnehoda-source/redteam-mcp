@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>RedTeam MCP — Attack Simulation Platform</title>
+<script src="https://accounts.google.com/gsi/client" async></script>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background:#0a0a0a; color:#e0e0e0; }
@@ -85,6 +86,20 @@ body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background:#0a0a0a
 </head>
 <body>
 
+<!-- ── Google Auth Overlay ── -->
+<div id="login-overlay" style="display:none;position:fixed;inset:0;background:#0a0a0a;z-index:10000;flex-direction:column;align-items:center;justify-content:center;gap:32px;">
+    <div style="text-align:center;">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:26px;font-weight:700;color:#ff4444;letter-spacing:4px;text-shadow:0 0 20px rgba(255,68,68,.4);">REDTEAM MCP</div>
+        <div style="color:#888;font-size:12px;margin-top:6px;letter-spacing:2px;">ATTACK SIMULATION PLATFORM</div>
+    </div>
+    <div style="background:#111;border:1px solid #ff444440;border-radius:8px;padding:36px 40px;text-align:center;min-width:320px;box-shadow:0 0 40px rgba(255,68,68,.05);">
+        <div style="color:#888;font-size:13px;margin-bottom:24px;">Authenticate with your Google account to access the platform</div>
+        <div id="google-signin-btn" style="display:flex;justify-content:center;"></div>
+        <div id="auth-error" style="display:none;color:#ff4444;font-size:12px;margin-top:16px;"></div>
+    </div>
+    <div style="color:#444;font-size:11px;font-family:'JetBrains Mono',monospace;">Authorized personnel only</div>
+</div>
+
 <div class="header">
   <h1>☠️ RedTeam <span>MCP</span> — Attack Simulation Platform</h1>
   <div>
@@ -96,6 +111,11 @@ body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background:#0a0a0a
 
 <div class="container">
   <div class="sidebar" id="sidebar">
+    <h3 onclick="toggleSection('history-section')"><span class="toggle">▾</span>📜 Command History</h3>
+    <div id="history-section" class="section-content">
+      <div id="cmd-history-list"><div class="tech-item" style="color:#666">No commands yet</div></div>
+    </div>
+
     <h3 onclick="toggleSection('reports-section')"><span class="toggle">▾</span>📊 Reports</h3>
     <div id="reports-section" class="section-content">
       <div id="reports-list"><div class="tech-item" style="color:#666">No reports yet</div></div>
@@ -373,10 +393,16 @@ async function sendMessage() {
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: msg})
+      headers: {'Content-Type': 'application/json', ...getAuthHeaders()},
+      body: JSON.stringify({message: msg, session_id: sessionId})
     });
+    if (res.status === 401) {
+      authToken = null; sessionStorage.removeItem('rt_auth_token');
+      showLoginOverlay(); sendBtn.disabled = false; sendBtn.textContent = '⚡ Execute'; return;
+    }
     const data = await res.json();
+    if (data.session_id) sessionId = data.session_id;
+    loadCommandHistory();
     let html = `<strong style="color:#ff4444">☠️ RedTeam</strong><br>${data.response || ''}`;
 
     // Handle web scan results
@@ -446,7 +472,83 @@ input.addEventListener('keydown', e => {
   if (e.key === 'ArrowDown') { e.preventDefault(); if (historyIdx > 0) { historyIdx--; input.value = cmdHistory[historyIdx]; } else if (historyIdx === 0) { historyIdx = -1; input.value = ''; }}
 });
 
-// Load health + sidebar + reports
+// ── Auth ──
+let authToken = null;
+let tokenExpiry = 0;
+
+function showLoginOverlay() { document.getElementById('login-overlay').style.display = 'flex'; }
+function hideLoginOverlay() { document.getElementById('login-overlay').style.display = 'none'; }
+
+function handleCredentialResponse(response) {
+    authToken = response.credential;
+    try {
+        const payload = JSON.parse(atob(authToken.split('.')[1]));
+        tokenExpiry = payload.exp * 1000;
+        sessionStorage.setItem('rt_auth_token', authToken);
+        sessionStorage.setItem('rt_token_expiry', tokenExpiry);
+    } catch(e) {}
+    hideLoginOverlay();
+    bootApp();
+}
+
+function getAuthHeaders() {
+    if (!authToken) return {};
+    if (Date.now() > tokenExpiry - 300000) {
+        authToken = null;
+        sessionStorage.removeItem('rt_auth_token');
+        showLoginOverlay();
+        return {};
+    }
+    return {'Authorization': `Bearer ${authToken}`};
+}
+
+async function bootAuth() {
+    const resp = await fetch('/api/auth-config');
+    const config = await resp.json();
+    if (!config.auth_required) { bootApp(); return; }
+
+    const stored = sessionStorage.getItem('rt_auth_token');
+    const expiry = parseInt(sessionStorage.getItem('rt_token_expiry') || '0');
+    if (stored && Date.now() < expiry - 60000) {
+        authToken = stored; tokenExpiry = expiry; bootApp(); return;
+    }
+
+    showLoginOverlay();
+    const waitForGIS = setInterval(() => {
+        if (window.google && google.accounts) {
+            clearInterval(waitForGIS);
+            google.accounts.id.initialize({ client_id: config.client_id, callback: handleCredentialResponse, auto_select: true });
+            google.accounts.id.renderButton(document.getElementById('google-signin-btn'), { theme: 'filled_black', size: 'large', text: 'signin_with', shape: 'rectangular' });
+            google.accounts.id.prompt();
+        }
+    }, 100);
+}
+
+// ── Session ──
+let sessionId = null;
+
+function loadCommandHistory() {
+    fetch('/api/history').then(r=>r.json()).then(data=>{
+        const el = document.getElementById('cmd-history-list');
+        if (!el) return;
+        const cmds = data.commands || [];
+        if (!cmds.length) { el.innerHTML = '<div class="tech-item" style="color:#666">No commands yet</div>'; return; }
+        el.innerHTML = cmds.slice().reverse().map(c =>
+            `<div class="tech-item" onclick="rerunCommand('${c.command.replace(/'/g,"&#39;")}')" title="${c.result || ''}">
+                <div class="tech-id">${new Date(c.ts).toLocaleTimeString()}</div>
+                <div class="tech-name">${c.command.substring(0,60)}${c.command.length>60?'…':''}</div>
+            </div>`
+        ).join('');
+    }).catch(()=>{});
+}
+
+function rerunCommand(cmd) {
+    const input = document.querySelector('.input-bar input');
+    if (input) { input.value = cmd; input.focus(); }
+}
+
+// ── Load health + sidebar + reports ──
+function bootApp() {
 fetch('/health').then(r=>r.json()).then(d=>{
   document.getElementById('status-badge').textContent = '✅ online';
   document.getElementById('status-badge').style.borderColor = '#4caf50';
@@ -457,6 +559,10 @@ fetch('/health').then(r=>r.json()).then(d=>{
 });
 
 loadReports();
+loadCommandHistory();
+} // end bootApp
+
+bootAuth();
 </script>
 </body>
 </html>
