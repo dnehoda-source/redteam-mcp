@@ -41,7 +41,7 @@ GCP_PROJECT = os.getenv("GCP_PROJECT", "tito-436719")
 LOG_DIR = os.getenv("REDTEAM_LOG_DIR", os.path.expanduser("~/redteam-logs"))
 PORT = int(os.getenv("PORT", "8090"))
 OAUTH_CLIENT_ID = os.getenv("OAUTH_CLIENT_ID", "")
-ALLOWED_EMAILS = set(e.strip() for e in os.getenv("ALLOWED_EMAILS", "carter@linus.joonix.net,dnehoda@gmail.com").split(",") if e.strip())
+ALLOWED_EMAILS = set(e.strip() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip())
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 
